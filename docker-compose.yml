@@ -1,0 +1,147 @@
+version: '3.8'
+
+services:
+  # ========================================
+  # KAFKA INFRASTRUCTURE
+  # ========================================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: rcs-zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_SYNC_LIMIT: 2
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-logs:/var/lib/zookeeper/log
+    networks:
+      - rcs-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: rcs-kafka
+    restart: unless-stopped
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      KAFKA_COMPRESSION_TYPE: gzip
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: "-Xmx2G -Xms2G"
+      KAFKA_MESSAGE_MAX_BYTES: 5242880
+      KAFKA_REPLICA_FETCH_MAX_BYTES: 5242880
+      KAFKA_MAX_REQUEST_SIZE: 5242880
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - rcs-network
+
+  kafka-setup:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka-setup
+    depends_on:
+      - kafka
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo 'Waiting for Kafka to be ready...'
+        cub kafka-ready -b kafka:29092 1 30
+        echo 'Creating topics with proper partitions...'
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic webhook-events --partitions 8 --replication-factor 1 --config retention.ms=86400000 --config compression.type=gzip --config min.insync.replicas=1
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic message-stats --partitions 6 --replication-factor 1 --config retention.ms=86400000 --config compression.type=gzip
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic campaign-batch-entries --partitions 3 --replication-factor 1 --config retention.ms=86400000 --config compression.type=gzip
+        echo 'Topics created successfully!'
+        kafka-topics --bootstrap-server kafka:29092 --list
+    networks:
+      - rcs-network
+
+  # ========================================
+  # NODE.JS BACKEND & CONSUMERS
+  # ========================================
+  # Common settings for all Node.js services
+  x-node-common: &node-common
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - kafka
+    env_file: .env
+    environment:
+      - NODE_ENV=production
+      - KAFKA_BROKER=kafka:29092 # Point to Kafka container internally
+      - REDIS_URL=redis://redis:6379 # Optional: just in case it's still in code
+    networks:
+      - rcs-network
+
+  backend-api:
+    <<: *node-common
+    container_name: rcs-backend-api
+    command: ["node", "src/index.js"]
+    ports:
+      - "3000:3000"
+
+  webhook-consumer:
+    <<: *node-common
+    container_name: rcs-webhook-consumer
+    command: ["node", "src/workers/webhookConsumer.js"]
+    deploy:
+      replicas: 1
+
+  stats-consumer:
+    <<: *node-common
+    container_name: rcs-stats-consumer
+    command: ["node", "src/workers/statsConsumer.js"]
+    deploy:
+      replicas: 1 # You can increase this in production
+
+  batch-consumer:
+    <<: *node-common
+    container_name: rcs-batch-consumer
+    command: ["node", "src/workers/batchEntriesConsumer.js"]
+    deploy:
+      replicas: 1
+
+  expire-pending-cron:
+    <<: *node-common
+    container_name: rcs-expire-cron
+    command: ["node", "scripts/expirePendingMessages.js"]
+
+  # ========================================
+  # NGINX REVERSE PROXY
+  # ========================================
+  nginx:
+    image: nginx:alpine
+    container_name: rcs-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx-rcssender-final.conf:/etc/nginx/conf.d/default.conf:ro
+      # Optional: Mount frontend dist if Nginx is serving it
+      # - /var/www/rcs-frontend/dist:/var/www/rcs-frontend/dist:ro
+    depends_on:
+      - backend-api
+    networks:
+      - rcs-network
+
+volumes:
+  zookeeper-data:
+  zookeeper-logs:
+  kafka-data:
+
+networks:
+  rcs-network:
+    driver: bridge
