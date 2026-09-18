@@ -760,6 +760,15 @@ async function startStatsConsumer() {
                 oldStatus: msg.status || 'pending',
                 campaignId: msg.campaignId
               });
+              
+              // Pass the stats change to the in-memory worker
+              const newStatus = statusChanges.get(msg.messageId);
+              if (newStatus && msg.campaignId) {
+                campaignStatsWorker.addStatsUpdate(msg.campaignId, {
+                  oldStatus: msg.status || 'pending',
+                  newStatus: newStatus
+                });
+              }
             }
           }
 
