@@ -60,11 +60,13 @@ async function archiveOldCampaigns() {
       }
 
       // Populate user data manually to handle deleted users
-      if (campaign.userId) {
-        const user = await User.findById(campaign.userId).select('name email').lean();
-        campaign.userId = user || { _id: campaign.userId, name: 'Deleted User', email: 'N/A' };
+      const rawUserId = campaign.userId;
+      campaign.userObjectId = rawUserId && rawUserId._id ? rawUserId._id : rawUserId;
+      if (campaign.userObjectId) {
+        const user = await User.findById(campaign.userObjectId).select('name email').lean();
+        campaign.userInfo = user || { _id: campaign.userObjectId, name: 'Deleted User', email: 'N/A' };
       } else {
-        campaign.userId = { name: 'Unknown User', email: 'N/A' };
+        campaign.userInfo = { name: 'Unknown User', email: 'N/A' };
       }
 
       oldCampaigns = [campaign];
@@ -75,7 +77,7 @@ async function archiveOldCampaigns() {
 
       console.log(`[ArchiveCron] Finding campaigns older than ${cutoffDate.toISOString()}`);
 
-      // Find old campaigns
+      // Find old settled campaigns
       oldCampaigns = await Campaign.find({
         createdAt: { $lt: cutoffDate },
         status: 'settled'
@@ -83,11 +85,13 @@ async function archiveOldCampaigns() {
 
       // Populate user data manually to handle deleted users
       for (const campaign of oldCampaigns) {
-        if (campaign.userId) {
-          const user = await User.findById(campaign.userId).select('name email').lean();
-          campaign.userId = user || { name: 'Deleted User', email: 'N/A' };
+        const rawUserId = campaign.userId;
+        campaign.userObjectId = rawUserId && rawUserId._id ? rawUserId._id : rawUserId;
+        if (campaign.userObjectId) {
+          const user = await User.findById(campaign.userObjectId).select('name email').lean();
+          campaign.userInfo = user || { _id: campaign.userObjectId, name: 'Deleted User', email: 'N/A' };
         } else {
-          campaign.userId = { name: 'Unknown User', email: 'N/A' };
+          campaign.userInfo = { name: 'Unknown User', email: 'N/A' };
         }
       }
     }
@@ -102,7 +106,7 @@ async function archiveOldCampaigns() {
 
     for (const campaign of oldCampaigns) {
       try {
-        console.log(`[ArchiveCron] Processing campaign ${campaign._id} (${campaign.name})`);
+        console.log(`[ArchiveCron] Processing campaign ${campaign._id} (${campaign.name || 'Unnamed'})`);
 
         // Count total messages
         const totalMessages = await ContactCampaignMessage.countDocuments({ campaignId: campaign._id });
@@ -114,8 +118,51 @@ async function archiveOldCampaigns() {
         const ESTIMATED_BYTES_PER_ROW = 200; // Conservative estimate
         let uploadResults = [];
 
-        // Check if chunking is needed based on message count
-        const needsChunking = totalMessages > SAFE_ROWS_PER_FILE;
+        // Check if campaign has 0 messages
+        if (totalMessages === 0) {
+          console.log(`[ArchiveCron] ℹ️ Campaign ${campaign._id} has 0 messages, archiving without Excel file`);
+
+          // If campaign was not settled and had blocked balance, refund it to user wallet
+          if (campaign.blockedAmount > 0 && campaign.userObjectId) {
+            try {
+              const userToRefund = await User.findById(campaign.userObjectId);
+              if (userToRefund) {
+                await User.findByIdAndUpdate(campaign.userObjectId, {
+                  $inc: {
+                    'wallet.balance': campaign.blockedAmount,
+                    'wallet.blockedBalance': -campaign.blockedAmount
+                  },
+                  $push: {
+                    'wallet.transactions': {
+                      type: 'credit',
+                      amount: campaign.blockedAmount,
+                      balanceAfter: (userToRefund.wallet?.balance || 0) + campaign.blockedAmount,
+                      description: `Campaign "${campaign.name || 'Unnamed'}" archived with 0 messages - released blocked balance`,
+                      processedBy: null,
+                      createdAt: new Date()
+                    }
+                  },
+                  $set: { 'wallet.lastUpdated': new Date() }
+                });
+                console.log(`[ArchiveCron] 💰 Released ₹${campaign.blockedAmount} blocked balance for user ${campaign.userObjectId}`);
+              }
+            } catch (refundErr) {
+              console.error(`[ArchiveCron] ⚠️ Error releasing blocked balance for campaign ${campaign._id}:`, refundErr.message);
+            }
+          }
+
+          uploadResults.push({
+            url: 'N/A',
+            publicId: 'N/A',
+            size: 0,
+            partNumber: 1,
+            totalParts: 1,
+            rowsStart: 0,
+            rowsEnd: 0
+          });
+        } else {
+          // Check if chunking is needed based on message count
+          const needsChunking = totalMessages > SAFE_ROWS_PER_FILE;
 
         if (needsChunking) {
           console.log(`[ArchiveCron] Campaign has ${totalMessages} messages, chunking required`);
@@ -209,7 +256,7 @@ async function archiveOldCampaigns() {
                 {
                   resource_type: 'raw',
                   folder: 'archived_campaigns',
-                  public_id: `campaign-${campaign.name.replace(/[^a-zA-Z0-9]/g, '_')}-${campaign._id}-part${chunkIndex + 1}-${Date.now()}`,
+                  public_id: `campaign-${(campaign.name || 'unnamed').replace(/[^a-zA-Z0-9]/g, '_')}-${campaign._id}-part${chunkIndex + 1}-${Date.now()}`,
                   format: 'xlsx',
                   access_mode: 'public',
                   flags: 'attachment'
@@ -312,7 +359,7 @@ async function archiveOldCampaigns() {
               {
                 resource_type: 'raw',
                 folder: 'archived_campaigns',
-                public_id: `campaign-${campaign.name.replace(/[^a-zA-Z0-9]/g, '_')}-${campaign._id}-${Date.now()}`,
+                public_id: `campaign-${(campaign.name || 'unnamed').replace(/[^a-zA-Z0-9]/g, '_')}-${campaign._id}-${Date.now()}`,
                 format: 'xlsx',
                 access_mode: 'public',
                 flags: 'attachment'
@@ -338,6 +385,7 @@ async function archiveOldCampaigns() {
             rowsEnd: totalMessages
           });
         }
+      }
 
         // Verify Excel files are properly accessible
         console.log(`[ArchiveCron] 📁 Total parts: ${uploadResults.length}`);
@@ -347,21 +395,26 @@ async function archiveOldCampaigns() {
           console.log(`[ArchiveCron] 📁 Rows: ${result.rowsStart}-${result.rowsEnd}`);
         });
 
+        const userObjectId = campaign.userObjectId || (campaign.userId?._id ? campaign.userId._id : campaign.userId);
+        const userInfo = campaign.userInfo || (campaign.userId?.name ? campaign.userId : { name: 'Deleted User', email: 'N/A' });
+        const primaryUpload = uploadResults[0] || { url: 'N/A', publicId: 'N/A' };
+
         // Save archived campaign record to database
         await ArchivedCampaign.create({
           campaignId: campaign._id.toString(),
-          campaignName: campaign.name,
-          userId: campaign.userId._id || campaign.userId,
-          userName: campaign.userId.name || 'Deleted User',
-          userEmail: campaign.userId.email || 'N/A',
-          botId: campaign.botId,
-          excelUrl: uploadResults[0].url, // Primary URL (first part or single file)
+          campaignName: campaign.name || 'Unnamed Campaign',
+          userId: userObjectId,
+          userName: userInfo.name || 'Deleted User',
+          userEmail: userInfo.email || 'N/A',
+          botId: campaign.botId || 'bot1',
+          excelUrl: primaryUpload.url || 'N/A', // Primary URL (first part or single file or 'N/A')
           excelParts: uploadResults.length > 1 ? uploadResults : undefined, // Store all parts if chunked
-          cloudinaryPublicId: uploadResults[0].publicId,
-          fileSize: uploadResults.reduce((sum, r) => sum + r.size, 0),
+          cloudinaryPublicId: primaryUpload.publicId || 'N/A',
+          fileSize: uploadResults.reduce((sum, r) => sum + (r.size || 0), 0),
           totalMessages: totalMessages,
           stats: {
             total: campaign.stats?.total || 0,
+            pending: campaign.stats?.pending || 0,
             sent: campaign.stats?.sent || 0,
             delivered: campaign.stats?.delivered || 0,
             read: campaign.stats?.read || 0,
@@ -370,9 +423,9 @@ async function archiveOldCampaigns() {
           },
           estimatedCost: campaign.estimatedCost || 0,
           actualCost: campaign.actualCost || 0,
-          refundedAmount: campaign.refundedAmount || 0,
+          refundedAmount: campaign.refundedAmount || campaign.blockedAmount || 0,
           campaignCreatedAt: campaign.createdAt,
-          campaignCompletedAt: campaign.completedAt
+          campaignCompletedAt: campaign.completedAt || campaign.createdAt
         });
         console.log(`[ArchiveCron] ✅ Archived campaign ${campaign._id} (${totalMessages} messages)`);
         console.log(`[ArchiveCron] 💾 Saved archived campaign record to database`);

@@ -329,9 +329,9 @@ campaignSchema.methods.completeCampaign = async function () {
       console.log(`[SettleCampaign] ⚠️  FALLBACK: Using cached stats (may be slightly outdated)`);
     }
     
-    // Validate stats exist
-    if (!this.stats || this.stats.total === 0) {
-      throw new Error('No campaign stats available for settlement - cannot proceed with payment');
+    // Ensure stats object exists (if total is 0, campaign settles with 0 charge and releases any blocked funds)
+    if (!this.stats) {
+      this.stats = { total: 0, pending: 0, sent: 0, delivered: 0, read: 0, replied: 0, expired: 0, failed: 0 };
     }
     
     console.log(`[SettleCampaign] Using ${syncSuccess ? 'FRESH' : 'CACHED'} stats for settlement`);

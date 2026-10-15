@@ -13,7 +13,7 @@ const archivedCampaignSchema = new mongoose.Schema({
   userId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
-    required: true,
+    required: false,
     index: true
   },
   userName: String,
@@ -21,7 +21,8 @@ const archivedCampaignSchema = new mongoose.Schema({
   botId: String,
   excelUrl: {
     type: String,
-    required: true
+    required: false,
+    default: 'N/A'
   },
   excelParts: [{
     url: String,
