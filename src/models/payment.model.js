@@ -22,13 +22,11 @@ const paymentSchema = new mongoose.Schema(
             type: String,
             required: true,
             unique: true,
-            index: true,
         },
 
         // Razorpay Payment Details (populated after payment)
         razorpayPaymentId: {
             type: String,
-            sparse: true,
         },
         razorpaySignature: {
             type: String,
